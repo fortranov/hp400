@@ -131,67 +131,162 @@ class HPM425Printer:
         try:
             print("   🖥️  Поиск M425 через Windows...")
             
-            # Расширенный поиск M425
-            search_queries = [
-                'Name like "%M425%" or Name like "%400 MFP%"',
-                'Name like "%LaserJet Pro 400%" and Name like "%MFP%"',
-                'DriverName like "%M425%" or DriverName like "%400 MFP%"'
-            ]
-            
-            for query in search_queries:
-                try:
-                    result = subprocess.run([
-                        'wmic', 'printer', 'where', query,
-                        'get', 'Name,PortName,DriverName,Status'
-                    ], capture_output=True, text=True, timeout=20)
+            # 1. Базовый поиск всех принтеров
+            print("      🔍 Шаг 1: Поиск всех принтеров...")
+            try:
+                result = subprocess.run([
+                    'wmic', 'printer', 'get', 'Name,PortName,DriverName,Status'
+                ], capture_output=True, text=True, timeout=15)
+                
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')[1:]
+                    print(f"      📋 Найдено принтеров: {len([l for l in lines if l.strip()])}")
                     
-                    if result.returncode == 0:
-                        lines = result.stdout.strip().split('\n')[1:]
-                        for line in lines:
-                            if line.strip():
-                                parts = [p.strip() for p in line.split('\t') if p.strip()]
+                    for line in lines:
+                        if line.strip():
+                            # Проверяем каждый принтер на соответствие M425
+                            if any(term.upper() in line.upper() for term in ['M425', 'MFP', 'LASERJET', 'HP']):
+                                print(f"      ⭐ Потенциальный M425: {line.strip()}")
+                                parts = [p.strip() for p in re.split(r'\s{2,}', line.strip()) if p.strip()]
                                 if len(parts) >= 2:
                                     printer_info = {
-                                        'name': parts[1] if len(parts) > 1 else 'Unknown',
+                                        'name': parts[1] if len(parts) > 1 else parts[0],
                                         'port': parts[2] if len(parts) > 2 else 'Unknown',
                                         'driver': parts[0] if len(parts) > 0 else 'Unknown',
                                         'status': parts[3] if len(parts) > 3 else 'Unknown',
-                                        'type': 'USB' if 'USB' in parts[2] else 'Network',
-                                        'model': 'M425 MFP'
+                                        'type': 'USB' if 'USB' in str(parts) else 'Network',
+                                        'model': 'M425 MFP',
+                                        'detection_method': 'base_search'
                                     }
                                     
-                                    # Проверяем, что это действительно M425
                                     if self._is_m425_printer(printer_info):
                                         printers.append(printer_info)
-                except:
-                    continue
+            except Exception as e:
+                print(f"      ❌ Ошибка базового поиска: {e}")
             
-            # Дополнительный поиск через порты
-            print("   🔌 Поиск M425 через USB порты...")
+            # 2. Целевой поиск M425
+            print("      🔍 Шаг 2: Целевой поиск M425...")
+            search_queries = [
+                ('Name like "%M425%"', 'по имени M425'),
+                ('Name like "%400%" and Name like "%MFP%"', 'по 400 MFP'),
+                ('Name like "%LaserJet%" and Name like "%MFP%"', 'по LaserJet MFP'),
+                ('DriverName like "%M425%"', 'по драйверу M425'),
+                ('DriverName like "%400%" and DriverName like "%MFP%"', 'по драйверу 400 MFP'),
+                ('Name like "%HP%" and PortName like "USB%"', 'HP на USB'),
+            ]
+            
+            for query, description in search_queries:
+                try:
+                    print(f"         🔎 Поиск {description}...")
+                    result = subprocess.run([
+                        'wmic', 'printer', 'where', query,
+                        'get', 'Name,PortName,DriverName,Status'
+                    ], capture_output=True, text=True, timeout=15)
+                    
+                    if result.returncode == 0 and result.stdout.strip():
+                        lines = result.stdout.strip().split('\n')[1:]
+                        for line in lines:
+                            if line.strip():
+                                print(f"         ✅ Найден: {line.strip()}")
+                                parts = [p.strip() for p in re.split(r'\s{2,}', line.strip()) if p.strip()]
+                                if len(parts) >= 2:
+                                    printer_info = {
+                                        'name': parts[1] if len(parts) > 1 else parts[0],
+                                        'port': parts[2] if len(parts) > 2 else 'Unknown',
+                                        'driver': parts[0] if len(parts) > 0 else 'Unknown',  
+                                        'status': parts[3] if len(parts) > 3 else 'Unknown',
+                                        'type': 'USB' if 'USB' in str(parts) else 'Network',
+                                        'model': 'M425 MFP',
+                                        'detection_method': f'targeted_{description}'
+                                    }
+                                    
+                                    # Избегаем дубликатов
+                                    if not any(p.get('name') == printer_info['name'] for p in printers):
+                                        printers.append(printer_info)
+                except Exception as e:
+                    print(f"         ❌ Ошибка поиска {description}: {e}")
+            
+            # 3. Поиск через USB порты
+            print("      🔍 Шаг 3: Поиск через USB порты...")
             for port in ['USB001', 'USB002', 'USB003', 'USB004']:
                 try:
+                    print(f"         🔌 Проверка порта {port}...")
                     result = subprocess.run([
                         'wmic', 'printer', 'where', f'PortName="{port}"',
-                        'get', 'Name,DriverName'
+                        'get', 'Name,DriverName,Status'
                     ], capture_output=True, text=True, timeout=10)
                     
                     if result.returncode == 0 and result.stdout.strip():
                         lines = result.stdout.strip().split('\n')[1:]
                         for line in lines:
-                            if line.strip() and any(model in line for model in self.model_variations):
-                                printers.append({
-                                    'name': line.strip(),
-                                    'port': port,
-                                    'type': 'USB',
-                                    'model': 'M425 MFP',
-                                    'detected_via': 'port_scan'
-                                })
-                except:
-                    continue
+                            if line.strip():
+                                print(f"         ✅ Принтер на {port}: {line.strip()}")
+                                # Проверяем, есть ли признаки M425
+                                if any(model.upper() in line.upper() for model in self.model_variations + ['HP', 'LASERJET']):
+                                    parts = [p.strip() for p in re.split(r'\s{2,}', line.strip()) if p.strip()]
+                                    printer_info = {
+                                        'name': parts[1] if len(parts) > 1 else parts[0],
+                                        'port': port,
+                                        'driver': parts[0] if len(parts) > 0 else 'Unknown',
+                                        'status': parts[2] if len(parts) > 2 else 'Unknown',
+                                        'type': 'USB',
+                                        'model': 'M425 MFP (suspected)',
+                                        'detection_method': f'usb_port_{port}'
+                                    }
+                                    
+                                    # Избегаем дубликатов
+                                    if not any(p.get('port') == port for p in printers):
+                                        printers.append(printer_info)
+                except Exception as e:
+                    print(f"         ❌ Ошибка проверки {port}: {e}")
+            
+            # 4. PowerShell расширенный поиск
+            print("      🔍 Шаг 4: PowerShell диагностика...")
+            try:
+                ps_script = '''
+Get-WmiObject -Class Win32_Printer | Where-Object {
+    $_.Name -like "*HP*" -or 
+    $_.Name -like "*M425*" -or
+    $_.Name -like "*400*" -or
+    $_.Name -like "*MFP*" -or
+    $_.Name -like "*LaserJet*" -or
+    $_.DriverName -like "*HP*" -or
+    $_.DriverName -like "*M425*" -or
+    $_.PortName -like "USB*"
+} | Select-Object Name, PortName, DriverName, Status | ConvertTo-Csv -NoTypeInformation
+'''
+                result = subprocess.run([
+                    'powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_script
+                ], capture_output=True, text=True, timeout=20)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    lines = result.stdout.strip().split('\n')[1:]  # Пропускаем заголовок CSV
+                    for line in lines:
+                        if line.strip():
+                            # Парсим CSV строку
+                            parts = [p.strip('"') for p in line.split('","')]
+                            if len(parts) >= 3:
+                                print(f"         ✅ PowerShell: {parts[0]} на {parts[1]}")
+                                printer_info = {
+                                    'name': parts[0],
+                                    'port': parts[1],
+                                    'driver': parts[2] if len(parts) > 2 else 'Unknown',
+                                    'status': parts[3] if len(parts) > 3 else 'Unknown',
+                                    'type': 'USB' if 'USB' in parts[1] else 'Network',
+                                    'model': 'M425 MFP (PS detected)',
+                                    'detection_method': 'powershell'
+                                }
+                                
+                                # Избегаем дубликатов
+                                if not any(p.get('name') == printer_info['name'] for p in printers):
+                                    printers.append(printer_info)
+            except Exception as e:
+                print(f"         ❌ Ошибка PowerShell: {e}")
                     
         except Exception as e:
             print(f"   ⚠️  Ошибка поиска M425 в Windows: {e}")
         
+        print(f"   📊 Всего найдено потенциальных M425: {len(printers)}")
         return printers
     
     def _find_linux_m425(self) -> List[Dict[str, str]]:
@@ -231,14 +326,40 @@ class HPM425Printer:
         return printers
     
     def _is_m425_printer(self, printer_info: Dict[str, str]) -> bool:
-        """Проверяет, является ли принтер M425"""
+        """Проверяет, является ли принтер M425 (улучшенная проверка)"""
         name = printer_info.get('name', '').lower()
         driver = printer_info.get('driver', '').lower()
+        port = printer_info.get('port', '').lower()
         
-        # Проверяем по имени и драйверу
+        # Расширенные критерии для M425
+        m425_indicators = [
+            'm425', '425', 'mfp', 
+            'laserjet pro 400', 'pro 400',
+            'hp laserjet', 'hewlett'
+        ]
+        
+        # Проверяем различные поля
+        text_to_check = f"{name} {driver} {port}".lower()
+        
+        # Базовая проверка по модели
         for variation in self.model_variations:
-            if variation.lower() in name or variation.lower() in driver:
+            if variation.lower() in text_to_check:
                 return True
+        
+        # Дополнительная проверка по ключевым словам
+        matches = sum(1 for indicator in m425_indicators if indicator in text_to_check)
+        
+        # Если есть 2+ совпадения, считаем это M425
+        if matches >= 2:
+            return True
+        
+        # Специальная проверка для HP принтеров на USB
+        if 'hp' in text_to_check and 'usb' in text_to_check:
+            return True
+        
+        # Если есть "mfp" в названии - высокая вероятность M425
+        if 'mfp' in text_to_check:
+            return True
         
         return False
     
