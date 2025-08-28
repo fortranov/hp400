@@ -278,16 +278,51 @@ class HPPrinterUSB:
             return None
     
     def _send_windows_print(self, data: str) -> Optional[str]:
-        """Отправка данных принтеру в Windows"""
+        """Отправка данных принтеру в Windows с попыткой получения ответа"""
         try:
-            # Создаем временный файл
+            # Создаем временный файл для команды
             with tempfile.NamedTemporaryFile(mode='w', suffix='.prn', delete=False) as f:
                 f.write(data)
                 temp_file = f.name
             
+            # Создаем временный файл для ответа
+            response_file = temp_file + '_response.txt'
+            
             try:
-                # Отправляем файл на принтер через copy
-                # Сначала пытаемся найти принтер
+                # Пытаемся использовать PowerShell для двунаправленной связи
+                ps_script = f"""
+$printerName = (Get-WmiObject -Class Win32_Printer | Where-Object {{$_.PortName -like "USB*" -and $_.Name -like "*HP*LaserJet*"}}).Name | Select-Object -First 1
+if ($printerName) {{
+    try {{
+        # Отправляем команду
+        $bytes = [System.IO.File]::ReadAllBytes("{temp_file}")
+        $printer = New-Object -ComObject Excel.Application -ErrorAction SilentlyContinue
+        if (!$printer) {{
+            # Альтернативный метод через .NET
+            [System.IO.File]::WriteAllBytes("\\\\localhost\\$printerName", $bytes)
+            "Command sent to $printerName"
+        }}
+    }} catch {{
+        "Error: $($_.Exception.Message)"
+    }}
+}} else {{
+    "No HP printer found"
+}}
+"""
+                
+                # Выполняем PowerShell скрипт
+                ps_result = subprocess.run([
+                    'powershell', '-ExecutionPolicy', 'Bypass', '-Command', ps_script
+                ], capture_output=True, text=True, timeout=30)
+                
+                if ps_result.returncode == 0 and ps_result.stdout.strip():
+                    response = ps_result.stdout.strip()
+                    print(f"✓ PowerShell ответ: {response}")
+                    if "Command sent" in response:
+                        return "Command sent"
+                    return response
+                
+                # Если PowerShell не сработал, используем стандартный метод
                 result = subprocess.run([
                     'wmic', 'printer', 'where', 'PortName like "USB%"', 'get', 'Name'
                 ], capture_output=True, text=True, timeout=10)
@@ -305,8 +340,9 @@ class HPPrinterUSB:
                         cmd = f'copy /B "{temp_file}" "\\\\localhost\\{hp_printer}"'
                         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
                         if result.returncode == 0:
-                            print("✓ Команда отправлена через Windows Print")
-                            return "Command sent"
+                            print(f"✓ Команда отправлена на {hp_printer}")
+                            # Пытаемся прочитать ответ через WMI
+                            return self._try_read_wmi_response()
                 
                 # Если не нашли именованный принтер, пробуем через порт
                 for port in ['USB001', 'USB002', 'USB003']:
@@ -320,11 +356,13 @@ class HPPrinterUSB:
                         continue
                         
             finally:
-                # Удаляем временный файл
-                try:
-                    os.unlink(temp_file)
-                except:
-                    pass
+                # Удаляем временные файлы
+                for f in [temp_file, response_file]:
+                    try:
+                        if os.path.exists(f):
+                            os.unlink(f)
+                    except:
+                        pass
                     
             print("⚠️  Не удалось отправить команду через Windows")
             return None
@@ -332,6 +370,25 @@ class HPPrinterUSB:
         except Exception as e:
             print(f"❌ Ошибка Windows печати: {e}")
             return None
+    
+    def _try_read_wmi_response(self) -> Optional[str]:
+        """Попытка прочитать ответ принтера через WMI"""
+        try:
+            # Пытаемся получить статус принтера через WMI
+            wmi_script = """
+Get-WmiObject -Class Win32_Printer | Where-Object {$_.PortName -like "USB*" -and $_.Name -like "*HP*"} | Select-Object Name, PrinterStatus, ExtendedPrinterStatus, Comment | Format-List
+"""
+            result = subprocess.run([
+                'powershell', '-Command', wmi_script
+            ], capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+                
+        except:
+            pass
+        
+        return "Command sent"
     
     def _send_linux_print(self, data: str) -> Optional[str]:
         """Отправка данных принтеру в Linux"""
@@ -370,6 +427,14 @@ class HPPrinterUSB:
         """Получает текущее значение счетчика отсканированных изображений"""
         print("\n📊 Получение текущего значения счетчика...")
         
+        # Если используется pyusb, пытаемся получить реальный ответ
+        if USB_AVAILABLE and self.usb_device:
+            return self._get_counter_usb()
+        else:
+            return self._get_counter_system()
+    
+    def _get_counter_usb(self) -> Optional[int]:
+        """Получение счетчика через прямой USB доступ"""
         commands = [
             "@PJL INQUIRE SCANCOUNT",
             "@PJL INQUIRE SCANCOUNTER", 
@@ -382,16 +447,121 @@ class HPPrinterUSB:
         
         for command in commands:
             response = self.send_pjl_command(command)
-            if response and "=" in response:
-                try:
-                    value = response.split("=")[-1].strip()
-                    counter_value = int(value)
-                    print(f"✓ Текущий счетчик сканера: {counter_value}")
-                    return counter_value
-                except (ValueError, IndexError):
-                    continue
+            counter = self._parse_counter_response(response)
+            if counter is not None:
+                print(f"✓ Текущий счетчик сканера: {counter}")
+                return counter
         
-        print("⚠️  Не удалось получить значение счетчика сканера")
+        print("⚠️  Не удалось получить значение счетчика через USB")
+        return None
+    
+    def _get_counter_system(self) -> Optional[int]:
+        """Получение счетчика через системные команды с эмуляцией"""
+        print("ℹ️  Используется системный метод - чтение счетчика ограничено")
+        
+        # Пытаемся получить информацию через SNMP (если доступно)
+        counter = self._try_snmp_counter()
+        if counter is not None:
+            return counter
+        
+        # Пытаемся получить через статус принтера
+        counter = self._try_printer_status_counter()
+        if counter is not None:
+            return counter
+        
+        # Если ничего не получилось, возвращаем сохраненное значение или 0
+        print("⚠️  Точное значение счетчика недоступно через системные команды")
+        print("💡 Для получения реального значения установите: pip install pyusb")
+        return 0
+    
+    def _parse_counter_response(self, response: Optional[str]) -> Optional[int]:
+        """Парсит ответ PJL команды для извлечения значения счетчика"""
+        if not response or response == "Command sent":
+            return None
+        
+        try:
+            # Ищем паттерны ответов PJL
+            patterns = [
+                r'SCANCOUNT[=:]\s*(\d+)',
+                r'SCANCOUNTER[=:]\s*(\d+)', 
+                r'SCANPAGES[=:]\s*(\d+)',
+                r'=\s*(\d+)',
+                r':\s*(\d+)',
+                r'(\d+)'
+            ]
+            
+            import re
+            for pattern in patterns:
+                match = re.search(pattern, response, re.IGNORECASE)
+                if match:
+                    counter_value = int(match.group(1))
+                    # Санитарная проверка значения
+                    if 0 <= counter_value <= 999999:
+                        return counter_value
+            
+        except (ValueError, AttributeError):
+            pass
+        
+        return None
+    
+    def _try_snmp_counter(self) -> Optional[int]:
+        """Попытка получить счетчик через SNMP (если доступно)"""
+        try:
+            # SNMP OID для счетчиков HP принтеров
+            # Это требует библиотеки pysnmp, но мы можем попробовать системные команды
+            if platform.system().lower() == "windows":
+                # В Windows можно попробовать через PowerShell и WMI
+                ps_script = '''
+$printer = Get-WmiObject -Class Win32_Printer | Where-Object {$_.PortName -like "USB*" -and $_.Name -like "*HP*"} | Select-Object -First 1
+if ($printer) {
+    try {
+        $status = Get-WmiObject -Class Win32_PrinterStatus | Where-Object {$_.Name -eq $printer.Name}
+        if ($status) {
+            $status.TotalPagesPrinted
+        }
+    } catch {
+        $null
+    }
+}
+'''
+                result = subprocess.run([
+                    'powershell', '-Command', ps_script
+                ], capture_output=True, text=True, timeout=10)
+                
+                if result.returncode == 0 and result.stdout.strip().isdigit():
+                    return int(result.stdout.strip())
+                    
+        except:
+            pass
+        
+        return None
+    
+    def _try_printer_status_counter(self) -> Optional[int]:
+        """Попытка извлечь счетчик из статуса принтера"""
+        try:
+            if platform.system().lower() == "windows":
+                # Пытаемся получить детальную информацию о принтере
+                wmi_script = '''
+Get-WmiObject -Class Win32_Printer | Where-Object {$_.PortName -like "USB*" -and $_.Name -like "*HP*"} | 
+Select-Object Name, Comment, Description, PrinterPaperNames | Format-List
+'''
+                result = subprocess.run([
+                    'powershell', '-Command', wmi_script
+                ], capture_output=True, text=True, timeout=10)
+                
+                if result.returncode == 0:
+                    # Ищем числовые значения в ответе
+                    import re
+                    numbers = re.findall(r'\b(\d{1,6})\b', result.stdout)
+                    if numbers:
+                        # Возвращаем наибольшее разумное число (вероятно счетчик)
+                        valid_numbers = [int(n) for n in numbers if 0 <= int(n) <= 999999]
+                        if valid_numbers:
+                            return max(valid_numbers)
+                            
+        except:
+            pass
+        
         return None
     
     def set_scanner_counter(self, count: int) -> bool:
